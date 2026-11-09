@@ -1070,6 +1070,21 @@ def _title_from(text) -> str:
     return "" if title.lower() in _PLACEHOLDER_CHAT_TITLES else title
 
 
+def _socket_has_cancellable_work(orch, websocket, user_id) -> bool:
+    ws_id = id(websocket)
+    if ws_id in getattr(orch, "_chat_recorders", {}):
+        return True
+    if any(key[0] == ws_id and lock.locked() for key, lock in getattr(orch, "_chat_locks", {}).items()):
+        return True
+    if any(key[0] == ws_id and not task.done() for key, task in getattr(orch, "_turn_tool_tasks", {}).items()):
+        return True
+    if any(call.websocket is websocket for call in getattr(orch, "_hitl_pending_calls", {}).values()):
+        return True
+    sessions = getattr(orch, "computer_sessions", None)
+    return bool(sessions is not None and user_id and any(
+        session.controller_ws_id == ws_id for session in sessions.live_for_owner(user_id)))
+
+
 class Orchestrator:
     @_transactional_runtime_construction
     def __init__(self):
@@ -1817,6 +1832,9 @@ class Orchestrator:
         return candidates[0] if candidates else None
 
     async def _cancel_turn(self, websocket, user_id, chat_id) -> None:
+        # A Stop that lands after the turn ended would show "Cancelled" and leave the flag for the next turn
+        if not _socket_has_cancellable_work(self, websocket, user_id):
+            return
         self.cancelled_sessions[id(websocket)] = True
         if user_id and user_id != "legacy" and chat_id:
             from orchestrator import hitl_confirmation

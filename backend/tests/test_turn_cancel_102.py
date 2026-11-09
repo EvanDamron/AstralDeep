@@ -1,6 +1,7 @@
 """Tests that orchestrator.py's turn cancel interrupts an in-flight tool dispatch: the turn stops,
 the dispatch is cancelled, a result that lands after the cancel is audited as late and never
-rendered or returned to the model, and a cancel with no tool in flight behaves as before.
+rendered or returned to the model, a cancel with no tool in flight behaves as before, and a cancel
+with nothing running on the socket does nothing.
 """
 
 from __future__ import annotations
@@ -96,14 +97,60 @@ async def test_a_result_landing_after_the_cancel_is_audited_and_never_rendered_o
     await _cleanup(orch, chat_id)
 
 
-async def test_a_cancel_with_no_tool_in_flight_behaves_as_before(orch):
+async def test_a_cancel_with_nothing_running_is_a_no_op(orch):
     ws = _ws(orch)
     chat_id = await _chat(orch)
+    orch._safe_send.reset_mock()
+    await orch._cancel_turn(ws, USER, chat_id)
+    assert not orch.cancelled_sessions.get(id(ws))
+    sent = [json.loads(call.args[1]) for call in orch._safe_send.await_args_list]
+    assert {"type": "chat_status", "status": "done", "message": "Cancelled"} not in sent
+    assert not _late_audits(orch)
+    await _cleanup(orch, chat_id)
+
+
+@pytest.mark.parametrize("work", ["recorder", "chat_lock", "tool_dispatch", "pending_approval", "computer_session"])
+async def test_a_cancel_with_work_on_the_socket_but_no_tool_in_flight_behaves_as_before(orch, work):
+    ws = _ws(orch)
+    chat_id = await _chat(orch)
+    blocker = None
+    if work == "recorder":
+        orch._chat_recorders[id(ws)] = SimpleNamespace(cancel_all_in_flight=AsyncMock())
+    elif work == "chat_lock":
+        lock = orch._chat_locks.setdefault((id(ws), "voice-chat"), asyncio.Lock())
+        await lock.acquire()
+    elif work == "tool_dispatch":
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        orch._turn_tool_tasks = {(id(ws), "voice-chat"): blocker}
+    elif work == "pending_approval":
+        orch._hitl_pending_calls = {"request-1": SimpleNamespace(owner=USER, chat="voice-chat", websocket=ws)}
+    else:
+        orch.computer_sessions = SimpleNamespace(
+            live_for_owner=lambda owner: [SimpleNamespace(controller_ws_id=id(ws), chat_id="voice-chat")])
     await orch._cancel_turn(ws, USER, chat_id)
     assert orch.cancelled_sessions[id(ws)] is True
     sent = [json.loads(call.args[1]) for call in orch._safe_send.await_args_list]
     assert {"type": "chat_status", "status": "done", "message": "Cancelled"} in sent
     assert not _late_audits(orch)
+    if work == "chat_lock":
+        lock.release()
+    if blocker is not None:
+        blocker.cancel()
+    orch._chat_recorders.pop(id(ws), None)
+    await _cleanup(orch, chat_id)
+
+
+async def test_a_late_cancel_after_the_turn_does_not_cancel_the_next_turn(orch):
+    _register(orch)
+    ws = _ws(orch)
+    chat_id = await _chat(orch)
+    calls = _llm(orch)
+    orch.execute_single_tool = AsyncMock(return_value=None)
+    await registered_chat(orch, ws, "first", chat_id, user_id=USER, dispatch=orch._serialized_chat, display_message=None)
+    await orch._cancel_turn(ws, USER, chat_id)
+    assert not orch.cancelled_sessions.get(id(ws))
+    assert not _cancel_alerts(orch)
+    assert calls
     await _cleanup(orch, chat_id)
 
 
